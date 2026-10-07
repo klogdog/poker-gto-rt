@@ -1,0 +1,15 @@
+{
+  "board": ["Ks", "Qh", "Jd", "7c", "2s"],
+  "players": [
+    {"name": "OOP", "range": "ATs,KQs,JJ"},
+    {"name": "IP", "range": "AQs,AA,AKs"}
+  ],
+  "pot": 100,
+  "effective_stack": 200,
+  "bet_sizes": [0.5],
+  "max_raises": 1,
+  "iterations": 1000,
+  "backend": "metal",
+  "samples": 128,
+  "seed": 7
+}

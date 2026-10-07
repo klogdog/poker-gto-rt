@@ -1,0 +1,19 @@
+{
+  "board": ["Ks", "Qh", "Jd", "7c", "2s"],
+  "players": [
+    {"name": "Seat 1", "range": "AsAh"},
+    {"name": "Seat 2", "range": "KcKd"},
+    {"name": "Seat 3", "range": "QcQd"},
+    {"name": "Seat 4", "range": "TcTd"},
+    {"name": "Seat 5", "range": "9c9d"},
+    {"name": "Seat 6", "range": "8c8d"}
+  ],
+  "pot": 100,
+  "effective_stack": 200,
+  "bet_sizes": [0.5],
+  "max_raises": 0,
+  "iterations": 1000,
+  "backend": "metal",
+  "samples": 128,
+  "seed": 7
+}

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gtosolver-api"
+version = "0.1.0"
+description = "Input-only Hold'em strategy solver API with Apple Metal support"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi==0.142.4",
+  "uvicorn==0.54.0",
+  "pydantic==2.13.5",
+  "numpy==2.5.3",
+  "treys==0.1.8",
+  "mlx==0.32.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[project.optional-dependencies]
+test = ["pytest==9.1.1", "httpx==0.28.1"]
+
+[project.scripts]
+gtosolver-api = "gtosolver.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = ["metal: executes solver operations on Apple Metal"]

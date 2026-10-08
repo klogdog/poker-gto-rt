@@ -14,8 +14,9 @@ app = FastAPI(
     title="GTOSolver API",
     version=__version__,
     description=(
-        "Explicit-input, 2–6 player Hold'em solver. Equal stacks, one betting round, "
-        "pot-size action abstraction. Flop/turn continue to showdown without further betting. "
+        "Explicit-input, 2–6 player Hold'em solver. Per-player stacks and contribution-ledger side pots, one betting round, "
+        "pot-size action abstraction with optional exact wagers at specified public histories. "
+        "Flop/turn continue to showdown without further betting. "
         "Heads-up exposes an abstract-game equilibrium gap; multiplayer strategies have no Nash guarantee."
     ),
 )
@@ -60,8 +61,12 @@ def solve(request: SolveRequest) -> dict:
             from .solver import solve as solve_heads_up
 
             options = request.model_dump(exclude={"players"})
-            result = solve_heads_up(oop_range=request.players[0].range, ip_range=request.players[1].range, **options)
-            result["players"] = [{"index": i, "name": player.name, "combos": len(expanded[i])} for i, player in enumerate(request.players)]
+            result = solve_heads_up(oop_range=request.players[0].range, ip_range=request.players[1].range,
+                                    stacks=[request.effective_stack if player.stack is None else player.stack for player in request.players],
+                                    committed=[player.committed for player in request.players], **options)
+            result["players"] = [{"index": i, "name": player.name, "combos": len(expanded[i]),
+                                  "stack": request.effective_stack if player.stack is None else player.stack,
+                                  "committed": player.committed} for i, player in enumerate(request.players)]
         else:
             from .multiplayer import solve as solve_multiplayer
 

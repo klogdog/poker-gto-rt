@@ -13,6 +13,7 @@ import numpy as np
 
 from .backend import Backend
 from .tree import BettingTree, Node
+from .settlement import settlement_payouts
 
 
 class CFRSolver:
@@ -56,8 +57,28 @@ class CFRSolver:
             smallest = np.finfo(np.float32).tiny
             if self.joint_mass < smallest or any(np.any((w > 0) & (w < smallest)) for w in normalized):
                 raise ValueError("range probabilities/blocker-conditioned mass are too small for Metal float32; use backend='cpu' or less extreme weights")
-            if min(tree.pot, tree.stack) < smallest:
+            positive_stacks = [stack for stack in tree.stacks if stack > 0]
+            if min([tree.pot, *positive_stacks]) < smallest:
                 raise ValueError("pot and stack are too small for Metal float32; use backend='cpu'")
+        # A heads-up terminal payoff is affine in the win/loss sign: contested
+        # chips depend on the hand; side pots and uncalled returns are fixed.
+        # Compute those coefficients on the host while keeping all matrix and
+        # regret operations on the requested numerical backend.
+        self.terminal_coefficients = {}
+        for node in tree.nodes:
+            if not node.terminal:
+                continue
+            outcomes = [settlement_payouts(tree.pot, tree.prior_committed, node.committed,
+                                          node.folded, tree.dead_contributions, strengths)
+                        for strengths in ([1, 0], [0, 1])]
+            coefficients = []
+            for player in (0, 1):
+                won = outcomes[player][player]
+                lost = outcomes[1 - player][player]
+                constant = (won + lost) / 2 - node.committed[player] - tree.pot / 2
+                coefficient = (won - lost) / 2
+                coefficients.append((float(constant), float(coefficient)))
+            self.terminal_coefficients[node.id] = coefficients
         with backend.context():
             self.compatibility = backend.array(matrix)
             self.showdown = backend.array(matrix * signs)
@@ -92,12 +113,10 @@ class CFRSolver:
             showdown = self.showdown if player == 0 else -self.showdown.T
             cache[key] = (opponent_reach, compatibility @ weighted, showdown @ weighted)
         _, compatible_mass, showdown_value = cache[key]
-        if node.terminal == "showdown":
-            return showdown_value * (self.tree.pot / 2 + node.committed[0])
-        if node.terminal == "fold":
-            sign = -1.0 if node.folded_player == player else 1.0
-            return compatible_mass * sign * (self.tree.pot / 2 + node.committed[node.folded_player])
-        raise RuntimeError("unknown terminal node")
+        if node.terminal not in {"showdown", "fold"}:
+            raise RuntimeError("unknown terminal node")
+        constant, coefficient = self.terminal_coefficients[node.id][player]
+        return compatible_mass * constant + showdown_value * coefficient
 
     def _traverse(self, node, player, own_reach, opponent_reach, policy, weight, cache):
         if node.terminal:
@@ -269,6 +288,11 @@ def solve(
     seed: int = 0,
     history: list[str] | None = None,
     include_tree: bool = False,
+    min_bet: float = 0.0,
+    action_overrides: list[dict] | None = None,
+    stacks: list[float] | None = None,
+    committed: list[float] | None = None,
+    dead_contributions: list[float] | None = None,
 ) -> dict:
     """Solve a postflop, heads-up, single-street game from explicit inputs."""
     from .cards import normalize_board
@@ -286,7 +310,9 @@ def solve(
     if isinstance(max_raises, bool) or not isinstance(max_raises, int):
         raise ValueError("max_raises must be an integer between 0 and 2")
     sizes = [0.5] if bet_sizes is None else bet_sizes
-    tree = BettingTree(pot, effective_stack, sizes, max_raises)
+    tree = BettingTree(pot, effective_stack, sizes, max_raises,
+                       min_bet=min_bet, action_overrides=action_overrides,
+                       stacks=stacks, committed=committed, dead_contributions=dead_contributions)
     history = [] if history is None else history
     if not isinstance(history, list) or any(not isinstance(x, str) for x in history):
         raise ValueError("history must be a list of action IDs")
@@ -315,21 +341,30 @@ def solve(
         "payoff_model": payoff_metadata,
         "model": {
             "players": 2,
+            "starting_stacks": list(tree.stacks),
+            "prior_committed": list(tree.prior_committed),
+            "dead_contributions": list(tree.dead_contributions),
+            "equal_initial_stacks": len(set(tree.stacks)) <= 1,
+            "side_pots": True,
             "betting_rounds": 1,
             "future_betting": False,
             "action_abstraction": {"bet_sizes": sizes, "max_raises": max_raises, "all_in_included": True,
-                                   "raise_fraction_basis": "pot_after_call", "minimum_full_raise_enforced": True},
+                                   "raise_fraction_basis": "pot_after_call", "minimum_full_raise_enforced": True,
+                                   "min_bet": tree.min_bet, "exact_override_count": len(tree.overrides.targets),
+                                   "exact_overrides": "one additional exact target at each specified reachable history; can extend the raise cap only there"},
             "ranges": "independent private range weights jointly conditioned on board and hole-card non-overlap",
-            "utility": "zero-sum chips centered on half the initial pot; folds lose half the initial pot plus own committed chips",
+            "utility": "terminal cumulative-pot payouts minus current-round investments, centered on half the initial pot; side pots and uncalled returns preserve eligibility",
             "equilibrium_claim": "finite-iteration approximate strategy; diagnostics apply to this action/payoff abstraction",
         },
-        "diagnostics": cfr.diagnostics(average),
+        "diagnostics": {**cfr.diagnostics(average), "min_bet": tree.min_bet,
+                        "exact_override_count": len(tree.overrides.targets),
+                        "action_node_limit": tree.max_nodes},
         "root": root_decision,
         "query": query_decision,
         "decision": query_decision,
         "limitations": [
             "Heads-up postflop only; one betting round is modeled.",
-            "Configured pot-fraction actions plus all-in form a finite betting abstraction.",
+            "Configured pot-fraction actions, path-scoped exact targets, and all-in form a finite betting abstraction.",
             "Flop and turn continuations resolve at showdown without subsequent betting.",
             "Finite CFR+ iterations produce an approximate strategy, not an equilibrium guarantee.",
         ] + (["Flop showdown equity is sampled; reported exploitability measures the sampled payoff game."] if len(board) == 3 else []),

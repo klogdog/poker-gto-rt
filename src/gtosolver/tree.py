@@ -1,9 +1,13 @@
-"""A bounded heads-up no-limit single-street action abstraction."""
+"""A bounded heads-up adapter for the shared no-limit betting round."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
+from typing import Sequence
+
+from .action_overrides import validate_history
+from .multiplayer import BettingRound, State
 
 
 @dataclass
@@ -36,17 +40,21 @@ class Node:
     terminal: str | None = None
     folded_player: int | None = None
     actions: list[Action] = field(default_factory=list)
+    folded: tuple[bool, bool] = (False, False)
 
 
 class BettingTree:
-    """Opening bets are fractions of the pot; raises use the pot after calling.
+    """Materialize the shared betting rules for vector heads-up CFR.
 
-    All-in is always included. A fraction that duplicates an all-in is merged.
-    max_raises counts raises after the initial bet. A short all-in is legal,
-    while an ordinary raise must be at least the previous full raise size.
+    Each player retains their actual starting stack. Short calls/all-ins,
+    full-raise reopening, and node-scoped exact targets use the same rules as
+    multiplayer; the numerical solver still operates on a bounded finite tree.
     """
 
-    def __init__(self, pot: float, stack: float, sizes: list[float], max_raises: int = 1, max_nodes: int = 512):
+    def __init__(self, pot: float, stack: float, sizes: list[float], max_raises: int = 1, max_nodes: int = 512,
+                 min_bet: float = 0.0, action_overrides: list[dict] | None = None,
+                 stacks: Sequence[float] | None = None, committed: Sequence[float] | None = None,
+                 dead_contributions: Sequence[float] | None = None):
         if not math.isfinite(pot) or pot <= 0 or not math.isfinite(stack) or stack <= 0:
             raise ValueError("pot and effective_stack must be finite and positive")
         if pot > 1e9 or stack > 1e9:
@@ -60,73 +68,40 @@ class BettingTree:
         self.sizes = sorted(set(float(s) for s in sizes))
         self.max_raises = max_raises
         self.max_nodes = max_nodes
+        self.round = BettingRound(2, pot, stack, sizes, max_raises,
+                                  min_bet=min_bet, action_overrides=action_overrides,
+                                  stacks=stacks, committed=committed,
+                                  dead_contributions=dead_contributions)
+        self.min_bet = self.round.min_bet
+        self.overrides = self.round.overrides
+        self.stacks = self.round.stacks
+        self.prior_committed = self.round.prior_committed
+        self.dead_contributions = self.round.dead_contributions
         self.nodes: list[Node] = []
-        self.root = self._build((0.0, 0.0), 0, 0, 0, 0.0)
+        self.root = self._build(self.round.initial)
 
-    def _node(self, committed, actor=None, terminal=None, folded_player=None):
+    def _build(self, state: State) -> Node:
         if len(self.nodes) >= self.max_nodes:
             raise ValueError(f"action abstraction exceeds {self.max_nodes} nodes; reduce bet_sizes or max_raises")
-        node = Node(len(self.nodes), actor, committed, terminal, folded_player)
+        folded_player = next((index for index, folded in enumerate(state.folded) if folded), None)
+        terminal = ("fold" if folded_player is not None else "showdown") if state.terminal else None
+        node = Node(len(self.nodes), state.actor, tuple(state.contributions), terminal,
+                    folded_player if terminal == "fold" else None, folded=tuple(state.folded))
         self.nodes.append(node)
-        return node
-
-    def _edge(self, node, action_id, action_type, target, fraction, child):
-        actor = node.actor
-        node.actions.append(Action(action_id, action_type, target - node.committed[actor], target, fraction,
-                                   action_type in {"bet", "raise", "call"} and target >= self.stack, child))
-
-    def _targets(self, committed, actor, facing_bet, last_raise):
-        other = 1 - actor
-        baseline = committed[other] if facing_bet else committed[actor]
-        current_pot = self.pot + sum(committed)
-        if facing_bet:
-            current_pot += committed[other] - committed[actor]
-        seen: set[float] = set()
-        for fraction in self.sizes:
-            target = min(self.stack, baseline + fraction * current_pot)
-            if target <= baseline:
-                continue
-            all_in = target >= self.stack
-            increment = target - baseline
-            if facing_bet and increment < last_raise and not math.isclose(increment, last_raise, rel_tol=1e-10) and not all_in:
-                continue
-            identity = target
-            if identity in seen:
-                continue
-            seen.add(identity)
-            label = "all_in" if all_in else f"{'raise' if facing_bet else 'bet'}_{fraction * 100:.17g}%"
-            yield label, target, None if all_in else fraction
-        if self.stack > baseline and self.stack not in seen:
-            yield "all_in", self.stack, None
-
-    def _build(self, committed, actor, checks, raises, last_raise):
-        other = 1 - actor
-        node = self._node(committed, actor)
-        facing = committed[other] > committed[actor]
-        if facing:
-            child = self._node(committed, terminal="fold", folded_player=actor)
-            self._edge(node, "fold", "fold", committed[actor], None, child)
-            called = list(committed)
-            called[actor] = committed[other]
-            child = self._node(tuple(called), terminal="showdown")
-            self._edge(node, "call", "call", called[actor], None, child)
-            if raises < self.max_raises and committed[other] < self.stack:
-                for label, target, fraction in self._targets(committed, actor, True, last_raise):
-                    raised = list(committed)
-                    raised[actor] = target
-                    child = self._build(tuple(raised), other, 0, raises + 1, target - committed[other])
-                    self._edge(node, label, "raise", target, fraction, child)
-        else:
-            child = self._node(committed, terminal="showdown") if checks else self._build(committed, other, 1, raises, last_raise)
-            self._edge(node, "check", "check", committed[actor], None, child)
-            for label, target, fraction in self._targets(committed, actor, False, last_raise):
-                bet = list(committed)
-                bet[actor] = target
-                child = self._build(tuple(bet), other, 0, raises, target - committed[actor])
-                self._edge(node, label, "bet", target, fraction, child)
+        if terminal:
+            return node
+        for action in self.round.actions(state):
+            child = self._build(self.round.advance(state, action))
+            kind = action.kind
+            if kind == "all_in":
+                kind = "raise" if max(state.contributions) > 0 else "bet"
+            node.actions.append(Action(action.label, kind, action.amount, action.to,
+                                       action.pot_fraction,
+                                       kind in {"bet", "raise", "call"} and action.to >= self.stacks[state.actor], child))
         return node
 
     def resolve(self, history: list[str]) -> Node:
+        validate_history(history)
         node = self.root
         for label in history:
             action = next((action for action in node.actions if action.id == label), None)
@@ -139,10 +114,15 @@ class BettingTree:
     def describe(self) -> dict:
         return {
             "root_node_id": self.root.id,
-            "opening_actor": "oop",
+            "opening_actor": None if self.root.actor is None else ("oop" if self.root.actor == 0 else "ip"),
             "all_in_included": True,
             "raise_fraction_basis": "pot_after_call",
             "max_raises": self.max_raises,
+            "min_bet": self.min_bet,
+            "stacks": list(self.stacks),
+            "prior_committed": list(self.prior_committed),
+            "dead_contributions": list(self.dead_contributions),
+            "action_overrides": [{"history": list(history), "to": target} for history, target in self.overrides.targets.items()],
             "nodes": [
                 {"id": n.id, "actor": None if n.actor is None else ("oop" if n.actor == 0 else "ip"),
                  "committed": list(n.committed), "terminal": n.terminal,

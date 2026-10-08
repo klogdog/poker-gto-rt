@@ -18,11 +18,14 @@ import numpy as np
 from .backend import Backend
 from .cards import decode_card, encode_card, evaluate_seven, normalize_board
 from .ranges import expand_range, sample_joint_hands
+from .action_overrides import ActionOverrides, exact_label, validate_history, validate_min_bet, validate_target
+from .settlement import normalize_ledger, settlement_payouts
 
 
 MAX_INFOSETS = 50_000
 MAX_VISITED_NODES = 10_000_000
 MAX_ACTIONS = 6
+MAX_PUBLIC_NODES = 50_000
 
 
 class MultiPlayerError(ValueError):
@@ -50,6 +53,7 @@ class State:
     last_raise: float = 0.0
     raises: int = 0
     history: tuple[str, ...] = ()
+    acted_at: tuple[float | None, ...] = ()
 
     @property
     def terminal(self) -> bool:
@@ -61,40 +65,129 @@ class State:
 
 
 class BettingRound:
-    """Equal initial stacks avoid side pots; index zero acts first."""
+    """One betting round with individual stack ceilings and cumulative pots.
+
+    Index zero acts first. Players already all-in retain their private cards
+    and pot eligibility, but do not receive another betting decision.
+    """
 
     def __init__(self, players: int, pot: float, stack: float,
-                 bet_sizes: Sequence[float], max_raises: int):
+                 bet_sizes: Sequence[float], max_raises: int,
+                 min_bet: float = 0.0, action_overrides: Sequence[dict] | None = None,
+                 stacks: Sequence[float] | None = None,
+                 committed: Sequence[float] | None = None,
+                 dead_contributions: Sequence[float] | None = None):
         self.players, self.pot, self.stack = players, float(pot), float(stack)
+        self.stacks, self.prior_committed, self.dead_contributions = normalize_ledger(
+            players, self.pot, self.stack, stacks, committed, dead_contributions)
+        self.utility_scale = max(self.pot, *self.stacks)
         self.bet_sizes = tuple(sorted(set(float(value) for value in bet_sizes)))
         self.max_raises = max_raises
+        self.min_bet = validate_min_bet(min_bet)
+        self.overrides = ActionOverrides(action_overrides)
+        self.public_histories: set[tuple[str, ...]] = set()
+        pending = tuple(index for index, amount in enumerate(self.stacks) if amount > 0)
         self.initial = State((0.0,) * players, (False,) * players,
-                             tuple(range(players)))
+                             pending if len(pending) > 1 else (),
+                             acted_at=(None,) * players)
+        # Validate each target against its reachable state before allocating any
+        # GPU tables. Shorter paths establish stable IDs for descendant paths.
+        for history in sorted(self.overrides.targets, key=lambda path: (len(path), path)):
+            state = self.query(history)
+            actions = self.actions(state)
+            target = self.overrides.targets[history]
+            action = next((candidate for candidate in actions if candidate.to == target
+                           and candidate.kind not in {"fold", "call", "check"}), None)
+            if action is None:
+                raise MultiPlayerError(f"Unused or unreachable action override history: {list(history)}")
+            following = self.advance(state, action)
+            # After a bet/raise, every remaining actor can call. Each remaining
+            # standard full raise can start at most one further active cycle.
+            # This validates closure before training, rather than discovering
+            # an unreportable 33rd history label in a GPU-backed traversal.
+            capable_seats = [index for index, folded in enumerate(following.folded)
+                             if not folded and following.contributions[index] < self.stacks[index]]
+            capable = len(capable_seats)
+            cycles = max(0, self.max_raises - following.raises) if capable > 1 else 0
+            active_others = max(0, capable - 1)
+            longest_default = len(following.history) + len(following.pending) + cycles * active_others
+            # Short all-ins can create further return-call cycles without
+            # consuming the full-raise cap. At an exhausted cap, only ceilings
+            # reachable through successive short increases need reserving.
+            # Before the cap is exhausted, later full raises can bring any
+            # remaining ceiling into short-raise range.
+            short_actors = capable
+            if not cycles:
+                ceiling = max(following.contributions)
+                minimum = max(self.min_bet, following.last_raise)
+                reachable: set[float] = set()
+                for target in sorted(set(self.stacks[index] for index in capable_seats)):
+                    if target <= ceiling:
+                        continue
+                    if target >= ceiling + minimum:
+                        break
+                    reachable.add(target)
+                    ceiling = target
+                short_actors = sum(self.stacks[index] in reachable for index in capable_seats)
+            longest_default += sum(max(0, capable - offset - 1) for offset in range(short_actors))
+            if longest_default > 32:
+                # The bound may include mutually exclusive full/short paths.
+                # Check actual continuations only near the limit, retaining
+                # valid 32-label paths while failing before GPU allocation.
+                self._assert_history_can_finish(following)
+        self.overrides.assert_used()
+
+    def _assert_history_can_finish(self, state: State) -> None:
+        if state.terminal:
+            return
+        if len(state.history) >= 32:
+            raise MultiPlayerError("Action override cannot finish within the 32-label history limit")
+        for action in self.actions(state):
+            self._assert_history_can_finish(self.advance(state, action))
 
     def actions(self, state: State) -> tuple[Action, ...]:
         if state.terminal:
             return ()
+        self.public_histories.add(state.history)
+        if len(self.public_histories) > MAX_PUBLIC_NODES:
+            raise MultiPlayerError(f"Action abstraction exceeds {MAX_PUBLIC_NODES} public nodes")
+        if len(state.history) >= 32:
+            raise MultiPlayerError("Betting history exceeds the 32-label limit before it can finish")
         actor = state.pending[0]
         contribution = state.contributions[actor]
+        stack = self.stacks[actor]
         current_bet = max(state.contributions)
-        call = max(0.0, current_bet - contribution)
+        call_to = min(current_bet, stack)
+        call = max(0.0, call_to - contribution)
         current_pot = self.pot + sum(state.contributions)
-        facing_bet = call > 0
+        facing_bet = current_bet > contribution
         actions = ([Action("fold", "fold", 0.0, contribution),
-                    Action("call", "call", call, current_bet)] if facing_bet
+                    Action("call", "call", call, call_to)] if facing_bet
                    else [Action("check", "check", 0.0, contribution)])
         opening = current_bet == 0
-        may_raise = opening or state.raises < self.max_raises
-        if may_raise and current_bet < self.stack:
+        override = self.overrides.target(state.history)
+        minimum = self.min_bet if opening else max(self.min_bet, state.last_raise)
+        acted_at = state.acted_at[actor] if state.acted_at else None
+        reopened = acted_at is None or current_bet >= acted_at + minimum
+        capable = sum(not folded and state.contributions[index] < self.stacks[index]
+                      for index, folded in enumerate(state.folded))
+        raise_eligible = reopened and capable > 1 and current_bet < stack
+        may_raise = raise_eligible and (opening or state.raises < self.max_raises)
+        short_all_in = raise_eligible and stack < current_bet + minimum
+        if override is not None:
+            if not raise_eligible:
+                raise MultiPlayerError("Action override cannot raise when betting has not reopened or no opponent can wager")
+            validate_target(override, current_bet, stack, minimum)
+            self.overrides.mark_used(state.history)
+        if may_raise or override is not None or short_all_in:
             used: set[float] = set()
-            for fraction in self.bet_sizes:
+            for fraction in self.bet_sizes if may_raise else ():
                 increment = fraction * (current_pot + call)
                 target = increment if opening else current_bet + increment
-                if (not opening and increment < state.last_raise
-                        and not math.isclose(increment, state.last_raise, rel_tol=1e-12, abs_tol=0.0)):
+                if target < (minimum if opening else current_bet + minimum):
                     continue
-                if target >= self.stack:
-                    continue  # The shared ceiling has one unambiguous all_in action.
+                if target >= stack:
+                    continue  # This actor's ceiling has one unambiguous all_in action.
                 if target in used or target <= current_bet:
                     continue
                 used.add(target)
@@ -102,18 +195,27 @@ class BettingRound:
                 label = f"{kind}_{fraction * 100:.17g}%"
                 actions.append(Action(label, kind, target - contribution,
                                       target, fraction))
-            # A short all-in raise cannot create another raising decision because
-            # every remaining player has this same total commitment ceiling.
-            actions.append(Action("all_in", "all_in", self.stack - contribution,
-                                  self.stack))
+            if override is not None and override not in used and override < stack:
+                kind = "bet" if opening else "raise"
+                actions.append(Action(exact_label(not opening, override), kind,
+                                      override - contribution, override,
+                                      (override - current_bet) / (current_pot + call)))
+            # A short all-in is legal even below the minimum full increment;
+            # advance() preserves the earlier full raise and reopening rights.
+            actions.append(Action("all_in", "all_in", stack - contribution, stack))
+        if len(actions) > MAX_ACTIONS:
+            raise MultiPlayerError("Action override exceeds the six-action budget; use at most two standard bet sizes")
         return tuple(actions)
 
     def advance(self, state: State, action: Action) -> State:
         if state.terminal or action not in self.actions(state):
             raise MultiPlayerError("Illegal betting action")
+        if len(state.history) >= 32:
+            raise MultiPlayerError("Betting history exceeds the 32-label limit")
         actor = state.pending[0]
         contributions = list(state.contributions)
         folded = list(state.folded)
+        acted_at = list(state.acted_at or (None,) * self.players)
         last_raise, raises = state.last_raise, state.raises
         old_bet = max(contributions)
         if action.kind == "fold":
@@ -123,18 +225,32 @@ class BettingRound:
         aggressive = action.to > old_bet
         if aggressive:
             increment = action.to - old_bet
-            last_raise = max(last_raise, increment)
-            raises += int(old_bet > 0)
+            minimum = self.min_bet if old_bet == 0 else max(self.min_bet, last_raise)
+            if action.to >= old_bet + minimum:
+                last_raise = increment
+                raises += int(old_bet > 0)
             order = tuple((actor + offset) % self.players
                           for offset in range(1, self.players))
             pending = tuple(index for index in order if not folded[index]
-                            and contributions[index] < self.stack)
+                            and contributions[index] < self.stacks[index])
         else:
-            pending = state.pending[1:]
+            pending = tuple(index for index in state.pending[1:] if not folded[index]
+                            and contributions[index] < self.stacks[index])
+        # Checking retains the right to open/raise when action returns after an
+        # incomplete opening all-in; it is not a prior response to that bet.
+        acted_at[actor] = None if action.kind == "check" else max(contributions)
+        # With one non-all-in seat remaining, only an outstanding call needs a
+        # decision. No player can wager into a pot nobody else can contest.
+        capable = [index for index, is_folded in enumerate(folded)
+                   if not is_folded and contributions[index] < self.stacks[index]]
+        if len(capable) <= 1:
+            pending = tuple(index for index in pending
+                            if contributions[index] < max(contributions))
         return State(tuple(contributions), tuple(folded), pending,
-                     last_raise, raises, state.history + (action.label,))
+                     last_raise, raises, state.history + (action.label,), tuple(acted_at))
 
     def query(self, history: Sequence[str]) -> State:
+        validate_history(history)
         state = self.initial
         for label in history:
             legal = self.actions(state)
@@ -149,13 +265,10 @@ class BettingRound:
     def payoff(self, state: State, strengths: Sequence[int]) -> np.ndarray:
         if not state.terminal:
             raise MultiPlayerError("Payoff requires a terminal betting state")
-        active = [index for index, folded in enumerate(state.folded) if not folded]
-        best = max(strengths[index] for index in active)
-        winners = [index for index in active if strengths[index] == best]
-        result = -np.asarray(state.contributions, dtype=np.float64)
-        share = (self.pot + sum(state.contributions)) / len(winners)
-        result[winners] += share
-        return result
+        payouts = settlement_payouts(self.pot, self.prior_committed,
+                                     state.contributions, state.folded,
+                                     self.dead_contributions, strengths)
+        return payouts - np.asarray(state.contributions, dtype=np.float64)
 
 
 @dataclass
@@ -287,7 +400,7 @@ class _Trainer:
         self.game, self.tables, self.rng = game, tables, rng
         self.visited_nodes = 0
         self.public_states: dict[tuple[str, ...], State] = {}
-        self.utility_scale = max(game.pot, game.stack)
+        self.utility_scale = getattr(game, "utility_scale", max(game.pot, game.stack))
 
     def traverse(self, state: State, hands: Sequence[tuple[int, int]],
                  strengths: Sequence[int], traverser: int, reaches: np.ndarray,
@@ -355,7 +468,9 @@ def _state_report(game: BettingRound, state: State, ranges, tables: _Tables,
                   posterior: dict[tuple[int, int], float] | None = None) -> dict:
     result = {"history": list(state.history), "terminal": state.terminal,
               "player": state.actor, "player_name": players[state.actor]["name"] if not state.terminal else None,
-              "contributions": list(state.contributions), "folded": list(state.folded)}
+              "contributions": list(state.contributions), "folded": list(state.folded),
+              "last_full_raise": state.last_raise, "full_raises": state.raises,
+              "acted_at": list(state.acted_at)}
     actions = game.actions(state)
     result["actions"] = [action.as_dict() for action in actions]
     if state.terminal:
@@ -422,8 +537,9 @@ def _evaluate_policy(game: BettingRound, ranges, board, tables: _Tables,
     query = game.initial if start is None else start
     for sample in range(samples):
         hands, strengths = _completed_deal(ranges, board, rng)
-        root_hand = tuple(sorted(hands[0]))
-        root_marginal[root_hand] = root_marginal.get(root_hand, 0.0) + 1.0
+        if game.initial.actor is not None:
+            root_hand = tuple(sorted(hands[game.initial.actor]))
+            root_marginal[root_hand] = root_marginal.get(root_hand, 0.0) + 1.0
         history_state = game.initial
         for label in query.history:
             actions = game.actions(history_state)
@@ -444,7 +560,7 @@ def _evaluate_policy(game: BettingRound, ranges, board, tables: _Tables,
     total = float(likelihoods.sum())
     reached = total > 0
     normalized = likelihoods / total if reached else np.zeros(samples)
-    utility_scale = max(game.pot, game.stack)
+    utility_scale = game.utility_scale
     normalized_means = np.sum(normalized[:, None] * (values / utility_scale), axis=0)
     means = normalized_means * utility_scale
     # Delta-method standard errors for a self-normalized importance estimator;
@@ -464,7 +580,7 @@ def _evaluate_policy(game: BettingRound, ranges, board, tables: _Tables,
                            for index, player in enumerate(players)],
             "samples": samples, "method": "history-likelihood-weighted Monte Carlo average-policy rollout",
             "units": "same chip units as pot and effective_stack",
-            "utility": "terminal pot receipt minus chips committed in this betting round",
+            "utility": "terminal pot receipt and unmatched return minus chips committed in this betting round; prior investments are sunk",
             "standard_error_scope": "approximate ratio-estimator sampling error; excludes strategy-training error",
             "history_conditioning": conditioning}
     return ev, root_marginal, query_marginal, conditioning
@@ -474,12 +590,16 @@ def solve(*, board: Sequence[str], players: Sequence[dict], pot: float,
           effective_stack: float, bet_sizes: Sequence[float] = (0.5,),
           max_raises: int = 1, iterations: int = 1000, backend: str = "metal",
           samples: int = 128, seed: int = 0, history: Sequence[str] | None = None,
-          include_tree: bool = False) -> dict:
+          include_tree: bool = False, min_bet: float = 0.0,
+          action_overrides: Sequence[dict] | None = None,
+          dead_contributions: Sequence[float] | None = None) -> dict:
     """Solve 3–6 players on the supplied street and return average policies.
 
     The root is the beginning of this round, with zero new contributions and
-    all players active. ``history`` selects a descendant policy to report; it
-    does not reconstruct earlier streets or change the supplied ranges.
+    all players live. Optional player ``stack`` values are remaining chips;
+    optional ``committed`` values are prior cumulative hand investments.
+    ``history`` selects a descendant policy to report; it does not reconstruct
+    earlier streets or change the supplied ranges.
     """
     started = time.perf_counter()
     if not 3 <= len(players) <= 6:
@@ -488,11 +608,6 @@ def solve(*, board: Sequence[str], players: Sequence[dict], pot: float,
         raise MultiPlayerError("pot and effective_stack must be positive finite numbers")
     if not math.isfinite(pot + len(players) * effective_stack):
         raise MultiPlayerError("pot plus total stacks must fit a finite floating-point chip amount")
-    if backend == "metal" and (min(pot, effective_stack) < np.finfo(np.float32).tiny
-                               or min(pot, effective_stack) / max(pot, effective_stack)
-                               < np.finfo(np.float32).tiny):
-        raise MultiPlayerError("Chip amounts or their relative scale are below Metal float32 precision; "
-                               "rescale the chip units or explicitly use backend='cpu'")
     if not 1 <= len(bet_sizes) <= 3 or any(not math.isfinite(value) or value <= 0 for value in bet_sizes):
         raise MultiPlayerError("Supply 1 to 3 positive finite pot-relative bet sizes")
     if not isinstance(max_raises, int) or not 0 <= max_raises <= 2:
@@ -503,10 +618,21 @@ def solve(*, board: Sequence[str], players: Sequence[dict], pot: float,
         raise MultiPlayerError("samples must be an integer between 2 and 2048")
     normalized_board = normalize_board(board, min_cards=3, max_cards=5)
     board_ids = [encode_card(card) for card in normalized_board]
-    player_specs = [{"name": player.get("name", f"Player {index + 1}"), "range": player["range"]}
+    player_specs = [{"name": player.get("name", f"Player {index + 1}"), "range": player["range"],
+                     "stack": effective_stack if player.get("stack") is None else player["stack"],
+                     "committed": player.get("committed", 0.0)}
                     for index, player in enumerate(players)]
     ranges = [expand_range(player["range"], normalized_board) for player in player_specs]
-    game = BettingRound(len(players), pot, effective_stack, bet_sizes, max_raises)
+    game = BettingRound(len(players), pot, effective_stack, bet_sizes, max_raises,
+                        min_bet=min_bet, action_overrides=action_overrides,
+                        stacks=[player["stack"] for player in player_specs],
+                        committed=[player["committed"] for player in player_specs],
+                        dead_contributions=dead_contributions)
+    positive_amounts = [game.pot, *(amount for amount in game.stacks if amount > 0)]
+    if backend == "metal" and (min(positive_amounts) < np.finfo(np.float32).tiny
+                               or min(positive_amounts) / game.utility_scale < np.finfo(np.float32).tiny):
+        raise MultiPlayerError("Chip amounts or their relative scale are below Metal float32 precision; "
+                               "rescale the chip units or explicitly use backend='cpu'")
     query = game.query(history or ())
     # This preflight rejects mutually incompatible ranges before allocating the
     # numerical backend. Every subsequent sampled deal is also bounded.
@@ -538,20 +664,30 @@ def solve(*, board: Sequence[str], players: Sequence[dict], pot: float,
     backend_info["host_operations"] = ["card sampling", "exact seven-card ranking", "betting-tree traversal"]
     backend_info["regret_matching_batches"] = tables.regret_matching_batches
     backend_info["table_update_batches"] = tables.update_batches
-    backend_info["regret_utility_scale"] = max(pot, effective_stack)
+    backend_info["regret_utility_scale"] = game.utility_scale
     result = {"algorithm": "external-sampling MCCFR with linear average strategies",
               "model": {"game": "multiplayer no-limit Hold'em", "player_count": len(players),
                         "street": {3: "flop", 4: "turn", 5: "river"}[len(board_ids)],
                         "betting_rounds": 1, "future_betting": False,
                         "showdown": "exact ranking on sampled deals" if len(board_ids) == 5
                         else "uniform sampled final-board continuation with no later betting",
-                        "equal_initial_stacks": True, "side_pots": False,
+                        "equal_initial_stacks": len(set(game.stacks)) == 1, "side_pots": True,
+                        "starting_stacks": list(game.stacks),
+                        "prior_committed": list(game.prior_committed),
+                        "dead_contributions": list(game.dead_contributions),
+                        "side_pot_accounting": "cumulative investments and current wagers, folded dead money, and unmatched returns",
                         "acting_order": [player["name"] for player in player_specs],
-                        "minimum_opening_bet": "smallest available supplied positive sizing or all-in; no blind unit supplied",
-                        "minimum_raise": "previous full bet or raise increment",
+                        "minimum_opening_bet": (game.min_bet if game.min_bet else "smallest available supplied positive sizing or all-in; no blind unit supplied"),
+                        "minimum_raise": "max(min_bet, previous full bet or raise increment); short all-in permitted",
+                        "action_abstraction": {"bet_sizes": list(game.bet_sizes), "max_raises": max_raises,
+                                               "min_bet": game.min_bet, "all_in_included": True,
+                                               "exact_override_count": len(game.overrides.targets),
+                                               "exact_overrides": "one additional exact target at each specified reachable history; a legal override node can extend the raise cap with that target and its all-in comparison"},
                         "range_sampling": "independent weighted ranges conditioned on disjoint cards"},
               "backend": backend_info, "players": [{"player": index, "name": player["name"],
-                                                        "combos": len(ranges[index])}
+                                                        "combos": len(ranges[index]),
+                                                        "stack": game.stacks[index],
+                                                        "committed": game.prior_committed[index]}
                                                        for index, player in enumerate(player_specs)],
               "root": root_report, "query": query_report, "ev": ev,
               "diagnostics": {"iterations": iterations, "training_deals": iterations,
@@ -559,13 +695,18 @@ def solve(*, board: Sequence[str], players: Sequence[dict], pot: float,
                               "traversals": iterations * len(players),
                               "infosets": len(tables.infos), "public_nodes": len(trainer.public_states),
                               "visited_nodes": trainer.visited_nodes, "seed": seed,
+                              "min_bet": game.min_bet, "exact_override_count": len(game.overrides.targets),
+                              "starting_stacks": list(game.stacks),
+                              "prior_committed": list(game.prior_committed),
+                              "dead_contributions": list(game.dead_contributions),
+                              "public_node_limit": MAX_PUBLIC_NODES,
                               "solve_wall_ms": (time.perf_counter() - started) * 1000},
               "limitations": ["Multiplayer regret minimization does not guarantee a Nash equilibrium; no exploitability certificate is computed.",
                               "Only the current betting round is modeled; flop and turn continuation samples final boards without future betting.",
                               "Training and reported EV use Monte Carlo deals even on the river; river hand ranking and terminal payouts are exact.",
                               "Unvisited or unaveraged hand information sets use an explicitly flagged uniform policy.",
                               "Reported EV standard errors cover rollout sampling only, not solver convergence or model error.",
-                              "All players start active with equal remaining stacks and no current-round commitments; earlier contributions are represented only by the pot.",
+                              "All supplied players start live with no new-round commitments; all-in players retain showdown eligibility but cannot act. Side pots require complete prior committed and folded dead-contribution ledgers; any unexplained root pot is shared dead money.",
                               "Aggregate policies and query EV use finite-sample compatible deals; history posteriors are weighted by trained average-policy action likelihoods.",
                               "Rare history queries can have low effective sample size; zero sampled reach returns no aggregate policy, recommendation, or EV.",
                               "Metal executes batched numerical table kernels; no GPU speedup or CPU numerical parity guarantee is claimed."]}
@@ -574,6 +715,8 @@ def solve(*, board: Sequence[str], players: Sequence[dict], pot: float,
         result["tree"] = [{"history": list(state.history), "player": state.actor,
                            "player_name": player_specs[state.actor]["name"],
                            "contributions": list(state.contributions), "folded": list(state.folded),
+                           "last_full_raise": state.last_raise, "full_raises": state.raises,
+                           "acted_at": list(state.acted_at),
                            "actions": [action.as_dict() for action in game.actions(state)]}
                           for state in states[:500]]
         result["tree_truncated"] = len(states) > 500
